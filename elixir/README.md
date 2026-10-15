@@ -175,6 +175,21 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- To reuse a prepared repository for several Linear issues, add one label such as
+  `workspace:slot-1` to each issue. Symphony uses `<workspace.root>/slot-1`.
+  If the directory is missing, Symphony creates it and runs `hooks.after_create` to initialize
+  it (for example, to clone the repository). Existing directories are reused without running
+  `after_create`. Fixed slots are kept when an issue finishes.
+  After initialization, Symphony writes a `.symphony-fixed-slot` marker inside the checkout
+  so cleanup preserves it across restarts and label changes; keep this marker in place.
+  Issues with a workspace slot label skip terminal workspace cleanup, including after PR merge
+  and transition to `Done`, even if the marker is missing.
+  Slot names share the workspace root with issue workspace names, so choose distinct names.
+  Only one worker can use a given slot at a time; another issue
+  using it retries later. Slot names use lowercase letters, digits, `_`, and `-` (up to 64
+  characters). Linear's Add label flow may create this as a `workspace` label group with a
+  `slot-1` child; Symphony recognizes that form too. Without a `workspace:` label, Symphony
+  creates the usual per-issue workspace.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

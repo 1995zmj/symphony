@@ -227,6 +227,7 @@ Fields (logical):
 - `path` (absolute workspace path)
 - `workspace_key` (collision-resistant sanitized issue identifier)
 - `created_now` (boolean, used to gate `after_create` hook)
+- `fixed_slot` (optional label-selected reusable checkout in implementations that support it)
 
 #### 4.1.5 Run Attempt
 
@@ -859,6 +860,21 @@ Workspace root:
 Per-issue workspace path:
 
 - `<workspace.root>/<workspace_key>`
+
+The Elixir implementation also accepts one Linear label `workspace:<slot>` to select a
+reusable workspace at `<workspace.root>/<slot>`. Missing directories are created and initialized
+with `after_create`; existing directories are reused without running that hook.
+A valid slot name contains only
+lowercase ASCII letters, digits, `_`, and `-`, starts with a letter or digit, and is at most 64
+characters. Linear's `workspace` label group with a `<slot>` child is interpreted equivalently.
+Invalid or conflicting slot labels fail workspace preparation. Labelled issues share
+the selected checkout across runs and issues. A slot is retained during issue cleanup, skips the
+`after_create` hook on reuse, and admits only one active worker at a time. Issues without a slot label use
+the per-issue path above. Fixed checkouts contain a persistent `.symphony-fixed-slot` marker
+so cleanup can recognize them without relying on their directory name or current issue labels.
+Slot names should be distinct from ordinary issue workspace keys because they share the root.
+Issues with workspace slot labels skip terminal workspace cleanup (including after PR merge
+and transition to Done) and the `before_remove` hook, even when the marker is missing.
 
 Workspace persistence:
 

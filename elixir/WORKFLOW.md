@@ -19,6 +19,9 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+# Linear issues may select a reusable workspace with a workspace:slot-1 label.
+# The checkout lives at <workspace.root>/slot-1 and is retained after the issue.
+# Missing directories are created and initialized by after_create; existing ones are reused.
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
@@ -274,6 +277,7 @@ Use this only when completion is blocked by missing required tools or missing au
 
 ## Guardrails
 
+- If the issue has a `workspace:<slot>` label (including a child of Linear's `workspace` label group), preserve the fixed checkout after PR merge and when moving the issue to `Done`. Do not delete the workspace or its `.symphony-fixed-slot` marker, and do not run workspace removal hooks for it.
 - If the branch PR is already closed/merged, do not reuse that branch or prior implementation state for continuation.
 - For closed/merged branch PRs, create a new branch from `origin/main` and restart from reproduction/planning as if starting fresh.
 - If issue state is `Backlog`, do not modify it; wait for human to move to `Todo`.

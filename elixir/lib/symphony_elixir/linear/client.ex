@@ -30,6 +30,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -75,6 +78,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -606,14 +612,27 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels
-    |> Enum.map(& &1["name"])
-    |> Enum.filter(&is_binary/1)
-    |> Enum.map(&(String.trim(&1) |> String.downcase()))
+    |> Enum.flat_map(fn
+      %{"name" => name, "parent" => %{"name" => parent}} when is_binary(name) and is_binary(parent) ->
+        name = normalize_label_name(name)
+
+        if normalize_label_name(parent) == "workspace",
+          do: [name, "workspace:" <> name],
+          else: [name]
+
+      %{"name" => name} when is_binary(name) ->
+        [normalize_label_name(name)]
+
+      _ ->
+        []
+    end)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
 
   defp extract_labels(_), do: []
+
+  defp normalize_label_name(name), do: name |> String.trim() |> String.downcase()
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do

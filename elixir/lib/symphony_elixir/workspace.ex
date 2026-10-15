@@ -7,6 +7,9 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @fixed_workspace_marker ".symphony-fixed-slot"
+  @slot_label ~r/\Aworkspace:(.*)\z/i
+  @slot_name ~r/\A[a-z0-9][a-z0-9_-]{0,63}\z/
 
   @type worker_host :: String.t() | nil
 
@@ -16,12 +19,10 @@ defmodule SymphonyElixir.Workspace do
     issue_context = issue_context(issue_or_identifier)
 
     try do
-      safe_id = workspace_key(issue_or_identifier)
-
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+      with {:ok, workspace, fixed?} <- selected_workspace(issue_or_identifier, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+        case initialize_selected_workspace(workspace, issue_context, created?, fixed?, worker_host) do
           :ok ->
             {:ok, workspace}
 
@@ -34,6 +35,113 @@ defmodule SymphonyElixir.Workspace do
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
+    end
+  end
+
+  @doc """
+  Reads an optional `workspace:<slot>` label from an issue.
+
+  Slot names are single safe path components. A missing label keeps the normal per-issue workspace.
+  """
+  @spec fixed_workspace_slot(map() | String.t() | nil) ::
+          :none | {:ok, String.t()} | {:error, term()}
+  def fixed_workspace_slot(%{labels: labels}) when is_list(labels) do
+    slots =
+      for label <- labels,
+          is_binary(label),
+          [_, slot] <- [Regex.run(@slot_label, String.trim(label))] do
+        String.trim(slot)
+      end
+
+    case slots do
+      [] ->
+        :none
+
+      [slot] ->
+        if Regex.match?(@slot_name, slot),
+          do: {:ok, slot},
+          else: {:error, {:invalid_fixed_workspace_slot, slot}}
+
+      _ ->
+        {:error, {:multiple_fixed_workspace_slots, slots}}
+    end
+  end
+
+  def fixed_workspace_slot(_issue), do: :none
+
+  @doc """
+  Runs an issue attempt while holding its fixed workspace slot, if one is selected.
+
+  A busy slot fails immediately so the orchestrator can retry the issue later.
+  """
+  @spec with_fixed_slot_lock(map() | String.t() | nil, worker_host(), (-> result)) ::
+          result | {:error, term()}
+        when result: term()
+  def with_fixed_slot_lock(issue, worker_host, fun) when is_function(fun, 0) do
+    case fixed_workspace_slot(issue) do
+      :none ->
+        fun.()
+
+      {:ok, slot} ->
+        lock = {{__MODULE__, :fixed_slot, worker_host, slot}, self()}
+
+        if :global.set_lock(lock, [node()], 0) do
+          try do
+            fun.()
+          after
+            :global.del_lock(lock, [node()])
+          end
+        else
+          {:error, {:fixed_workspace_busy, slot}}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp selected_workspace(issue, worker_host) do
+    case fixed_workspace_slot(issue) do
+      :none ->
+        selected_issue_workspace(workspace_key(issue), worker_host)
+
+      {:ok, slot} ->
+        selected_fixed_workspace(slot, worker_host)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp selected_issue_workspace(key, worker_host) do
+    with {:ok, workspace} <- workspace_path_for_issue(key, worker_host),
+         do: {:ok, workspace, false}
+  end
+
+  defp selected_fixed_workspace(slot, worker_host) do
+    with {:ok, workspace} <-
+           workspace_path_for_issue(slot, worker_host),
+         do: {:ok, workspace, true}
+  end
+
+  defp initialize_selected_workspace(workspace, issue_context, created?, fixed?, worker_host) do
+    with :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+      mark_fixed_workspace(workspace, fixed?, worker_host)
+    end
+  end
+
+  defp mark_fixed_workspace(_workspace, false, _worker_host), do: :ok
+
+  defp mark_fixed_workspace(workspace, true, nil),
+    do: File.write(Path.join(workspace, @fixed_workspace_marker), "")
+
+  defp mark_fixed_workspace(workspace, true, worker_host) do
+    script = "touch #{shell_escape(Path.join(workspace, @fixed_workspace_marker))}"
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:workspace_prepare_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -95,7 +203,7 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    case File.exists?(workspace) do
+    case File.exists?(workspace) and not fixed_slot_path?(workspace) do
       true ->
         case validate_workspace_path(workspace, nil) do
           :ok ->
@@ -106,17 +214,28 @@ defmodule SymphonyElixir.Workspace do
         end
 
       false ->
-        File.rm_rf(workspace)
+        {:ok, []}
     end
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
+    script = "test ! -e #{shell_escape(Path.join(workspace, @fixed_workspace_marker))}"
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> remove_remote_workspace(workspace, worker_host)
+      {:ok, {_output, 1}} -> {:ok, []}
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  defp remove_remote_workspace(workspace, worker_host) do
     maybe_run_before_remove_hook(workspace, worker_host)
 
     script =
       [
         remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
+        "if [ ! -e \"$workspace/#{@fixed_workspace_marker}\" ]; then rm -rf \"$workspace\"; fi"
       ]
       |> Enum.join("\n")
 
@@ -135,6 +254,22 @@ defmodule SymphonyElixir.Workspace do
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove_recorded(workspace, nil) when is_binary(workspace) do
+    if fixed_slot_path?(workspace) do
+      {:ok, []}
+    else
+      remove_recorded_local(workspace)
+    end
+  end
+
+  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    remove(workspace, worker_host)
+  end
+
+  def remove_recorded(workspace, _worker_host) do
+    {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+  end
+
+  defp remove_recorded_local(workspace) do
     if Path.type(workspace) == :absolute do
       case validate_recorded_workspace_path(workspace) do
         :ok ->
@@ -148,12 +283,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    remove(workspace, worker_host)
-  end
-
-  def remove_recorded(workspace, _worker_host) do
-    {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+  defp fixed_slot_path?(workspace) do
+    File.exists?(Path.join(workspace, @fixed_workspace_marker))
   end
 
   defp remove_local_workspace(workspace) do
@@ -165,6 +296,13 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
   @spec remove_issue_workspaces(term(), worker_host()) :: :ok
+  def remove_issue_workspaces(%{labels: labels} = issue, worker_host) when is_list(labels) do
+    case fixed_workspace_slot(issue) do
+      :none -> remove_issue_workspaces(Map.delete(issue, :labels), worker_host)
+      _slot_or_invalid_label -> :ok
+    end
+  end
+
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host)
       when is_binary(worker_host) do
     case workspace_path_for_issue(workspace_key(issue), worker_host) do

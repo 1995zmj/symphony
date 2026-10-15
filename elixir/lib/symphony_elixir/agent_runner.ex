@@ -36,6 +36,12 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    Workspace.with_fixed_slot_lock(issue, worker_host, fn ->
+      do_run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
+    end)
+  end
+
+  defp do_run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case Workspace.create_for_issue(issue, worker_host) do

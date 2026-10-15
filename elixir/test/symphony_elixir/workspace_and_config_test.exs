@@ -5,6 +5,136 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
+  test "labelled issues reuse a prepared fixed workspace without creation or cleanup hooks" do
+    relative_root = "fixed-slot-#{System.unique_integer([:positive])}"
+    workspace_root = Path.join(Path.dirname(Workflow.workflow_file_path()), relative_root)
+
+    try do
+      slot_path = Path.join(workspace_root, "slot-1")
+      hook_marker = Path.join(slot_path, "after-create-ran")
+      File.mkdir_p!(slot_path)
+      File.write!(Path.join(slot_path, ".git"), "gitdir: prepared-worktree\n")
+      File.write!(Path.join(slot_path, "local-progress.txt"), "keep me\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: relative_root,
+        hook_after_create: "touch after-create-ran"
+      )
+
+      first_issue = %Issue{id: "first", identifier: "QIB-6", labels: ["workspace:slot-1"]}
+      second_issue = %Issue{id: "second", identifier: "QIB-7", labels: ["workspace:slot-1"]}
+
+      assert {:ok, workspace} = Workspace.create_for_issue(first_issue)
+      assert workspace == slot_path
+      assert File.exists?(Path.join(workspace, ".symphony-fixed-slot"))
+      assert {:ok, ^workspace} = Workspace.create_for_issue(second_issue)
+      refute File.exists?(hook_marker)
+      assert File.read!(Path.join(workspace, "local-progress.txt")) == "keep me\n"
+
+      unlabelled_issue = %Issue{id: "third", identifier: "QIB-8", labels: []}
+      assert {:ok, fresh_workspace} = Workspace.create_for_issue(unlabelled_issue)
+      assert Path.basename(fresh_workspace) == "QIB-8"
+      assert File.exists?(Path.join(fresh_workspace, "after-create-ran"))
+
+      assert {:ok, []} = Workspace.remove_recorded(workspace, nil)
+      assert :ok = Workspace.remove_issue_workspaces(first_issue)
+      assert :ok = Workspace.remove_issue_workspaces("slot-1")
+      assert {:ok, []} = Workspace.remove(workspace)
+      assert File.dir?(workspace)
+
+      File.rm!(Path.join(workspace, ".symphony-fixed-slot"))
+      labelled_slot_issue = %{first_issue | identifier: "slot-1"}
+      assert :ok = Workspace.remove_issue_workspaces(labelled_slot_issue)
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "fixed workspace labels create missing slots and reject unsafe and ambiguous slots" do
+    relative_root = "fixed-slot-errors-#{System.unique_integer([:positive])}"
+    workspace_root = Path.join(Path.dirname(Workflow.workflow_file_path()), relative_root)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: relative_root,
+        hook_after_create: "test ! -e .symphony-fixed-slot && echo initialized >> initialized.txt"
+      )
+
+      missing = %Issue{id: "missing", identifier: "QIB-8", labels: ["workspace:slot-2"]}
+      unsafe = %Issue{id: "unsafe", identifier: "QIB-9", labels: ["workspace:../escape"]}
+      ambiguous = %Issue{id: "ambiguous", identifier: "QIB-10", labels: ["workspace:slot-1", "workspace:slot-2"]}
+
+      slot_path = Path.join(workspace_root, "slot-2")
+      assert {:ok, ^slot_path} = Workspace.create_for_issue(missing)
+      assert File.exists?(Path.join(slot_path, ".symphony-fixed-slot"))
+      assert {:ok, ^slot_path} = Workspace.create_for_issue(missing)
+      assert String.trim(File.read!(Path.join(slot_path, "initialized.txt"))) == "initialized"
+      assert {:ok, []} = Workspace.remove_recorded(slot_path, nil)
+      assert File.dir?(slot_path)
+      assert {:error, {:invalid_fixed_workspace_slot, "../escape"}} = Workspace.create_for_issue(unsafe)
+
+      assert {:error, {:multiple_fixed_workspace_slots, ["slot-1", "slot-2"]}} =
+               Workspace.create_for_issue(ambiguous)
+
+      refute File.exists?(Path.join(workspace_root, "QIB-8"))
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
+  test "fixed slot admits one worker at a time" do
+    issue = %Issue{id: "first", identifier: "QIB-6", labels: ["workspace:slot-1"]}
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Workspace.with_fixed_slot_lock(issue, nil, fn ->
+          send(parent, :slot_held)
+
+          receive do
+            :release_slot -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :slot_held
+
+    assert {:error, {:fixed_workspace_busy, "slot-1"}} =
+             Workspace.with_fixed_slot_lock(issue, nil, fn -> :unexpected end)
+
+    assert :other_slot_ok =
+             Workspace.with_fixed_slot_lock(
+               %{issue | labels: ["workspace:slot-2"]},
+               nil,
+               fn -> :other_slot_ok end
+             )
+
+    send(holder.pid, :release_slot)
+    assert :ok = Task.await(holder)
+    assert :acquired = Workspace.with_fixed_slot_lock(issue, nil, fn -> :acquired end)
+  end
+
+  test "Linear workspace label group selects its child as the fixed slot" do
+    raw_issue = %{
+      "id" => "issue-slot",
+      "identifier" => "QIB-6",
+      "title" => "Use prepared checkout",
+      "state" => %{"name" => "Todo"},
+      "labels" => %{
+        "nodes" => [
+          %{"name" => "slot-1", "parent" => %{"name" => "workspace"}},
+          %{"name" => "Bug", "parent" => %{"name" => "Type"}}
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.labels == ["slot-1", "workspace:slot-1", "bug"]
+    assert {:ok, "slot-1"} = Workspace.fixed_workspace_slot(issue)
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(

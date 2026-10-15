@@ -1138,12 +1138,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
-    case Map.get(metadata, :workspace_path) do
-      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
-
-      _ ->
-        cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+    case Workspace.fixed_workspace_slot(issue_or_identifier) do
+      :none -> cleanup_recorded_issue_workspace(issue_or_identifier, metadata)
+      _slot_or_invalid_label -> :ok
     end
   end
 
@@ -1156,6 +1153,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+
+  defp cleanup_recorded_issue_workspace(issue_or_identifier, metadata) do
+    case Map.get(metadata, :workspace_path) do
+      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+
+      _ ->
+        cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+    end
+  end
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
